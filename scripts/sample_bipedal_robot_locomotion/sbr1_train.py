@@ -121,7 +121,7 @@ def get_cfgs():
         "clip_actions": 100.0,
     }
     obs_cfg = {
-        "num_obs": 48,
+        "num_obs": 48, 
         "obs_scales": {
             "pos": [0.0, 1.0, 1.0],
             "lin_vel": 2.0,
@@ -139,7 +139,7 @@ def get_cfgs():
             "lin_vel_z": -1.0,
             "base_y": -1.0,
             "action_rate": -0.005,
-            "similar_to_default": -0.1,
+            "similar_to_default": -0.01,
             "base_orientation": 1.0,
             "feet_y": -3.0,
         },
@@ -147,7 +147,7 @@ def get_cfgs():
     command_cfg = {
         "num_commands": 3,
         # "lin_vel_x_range": [0.3, 0.3],
-        "lin_vel_x_range": [0, 1.0],
+        "lin_vel_x_range": [0.0, 3.6],
         "lin_vel_y_range": [0, 0],
         "ang_vel_range": [-0, 0],
     }
@@ -159,7 +159,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-l", "--log_dir", type=str, default="logs/sbr1_locomotion/test")
     parser.add_argument("-B", "--num_envs", type=int, default=4096)
-    parser.add_argument("--max_iterations", type=int, default=1001)
+    parser.add_argument("--max_iterations", type=int, default=20001)
     args = parser.parse_args()
 
     gs.init(logging_level="warning")
@@ -191,6 +191,7 @@ def main():
     )
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
+    runner.load("logs/sbr1_locomotion/test_0_35_from_0_34_54200/model_68200.pt")
 
     runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=True)
 

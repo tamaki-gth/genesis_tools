@@ -128,11 +128,20 @@ class Sbr1Env:
         self.feet_init_pos_y = torch.tensor([0.125, -0.125], device=self.device, dtype=gs.tc_float)
         self.base_lin_vel_x_th = torch.ones((self.num_envs, 1), device=self.device, dtype=gs.tc_float) * 1.5
 
-    def _resample_commands(self, envs_idx):
+    '''def _resample_commands(self, envs_idx):
         self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["lin_vel_x_range"], (len(envs_idx),), self.device)
         self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["lin_vel_y_range"], (len(envs_idx),), self.device)
-        self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["ang_vel_range"], (len(envs_idx),), self.device)
+        self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["ang_vel_range"], (len(envs_idx),), self.device)'''
+    def _resample_commands(self, envs_idx):
+        prev = self.commands[envs_idx, 0]
 
+        low = prev
+        high = torch.clamp(prev + 1.0,max=self.command_cfg["lin_vel_x_range"][1],)
+
+        self.commands[envs_idx, 0] = (low + (high - low) * torch.rand(len(low), device=self.device))
+        self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["lin_vel_y_range"],(len(envs_idx),),self.device,)
+        self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["ang_vel_range"],(len(envs_idx),),self.device,)
+ 
     def step(self, actions):
         self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
         exec_actions = self.last_actions if self.simulate_action_latency else self.actions
@@ -247,6 +256,7 @@ class Sbr1Env:
         self.episode_length_buf[envs_idx] = 0
         self.reset_buf[envs_idx] = True
 
+
         # randomization
         self.randomize_friction()
         self.randomize_pd_gains(67, 150, 20, 45)
@@ -260,7 +270,11 @@ class Sbr1Env:
             )
             self.episode_sums[key][envs_idx] = 0.0
 
-        self._resample_commands(envs_idx)
+        #self._resample_commands(envs_idx)
+        #エピソード開始時の目標速度
+        self.commands[envs_idx,0]=gs_rand_float(0.0,2.5,(len(envs_idx),),self.device,)
+        self.commands[envs_idx,1]=gs_rand_float(*self.command_cfg["lin_vel_y_range"],(len(envs_idx),),self.device,)
+        self.commands[envs_idx,2]=gs_rand_float(*self.command_cfg["ang_vel_range"],(len(envs_idx),),self.device,)
 
     def reset(self):
         self.reset_buf[:] = True
