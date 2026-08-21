@@ -272,7 +272,8 @@ class Sbr1Env:
 
         #self._resample_commands(envs_idx)
         #エピソード開始時の目標速度
-        self.commands[envs_idx,0]=gs_rand_float(0.0,2.5,(len(envs_idx),),self.device,)
+        #self.commands[envs_idx,0]=gs_rand_float(0.0,2.5,(len(envs_idx),),self.device,)
+        self.commands[envs_idx,0]=gs_rand_float(*self.command_cfg["lin_vel_x_range"],(len(envs_idx),),self.device,)
         self.commands[envs_idx,1]=gs_rand_float(*self.command_cfg["lin_vel_y_range"],(len(envs_idx),),self.device,)
         self.commands[envs_idx,2]=gs_rand_float(*self.command_cfg["ang_vel_range"],(len(envs_idx),),self.device,)
 
