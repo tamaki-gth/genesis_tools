@@ -10,7 +10,9 @@ def gs_rand_float(lower, upper, shape, device):
 
 
 class Sbr1Env:
-    def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False,  rendered_envs_idx=list(range(1))):
+        
+    def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False,  rendered_envs_idx=list(range(1)),eval_mode=False,):
+        self.eval_mode = eval_mode  # フラグをインスタンス変数として保持
         self.num_envs = num_envs
         self.num_obs = obs_cfg["num_obs"]
         self.num_privileged_obs = None
@@ -128,88 +130,99 @@ class Sbr1Env:
         self.feet_init_pos_y = torch.tensor([0.125, -0.125], device=self.device, dtype=gs.tc_float)
         self.base_lin_vel_x_th = torch.ones((self.num_envs, 1), device=self.device, dtype=gs.tc_float) * 1.5
 
+        self.max_velocities_x = torch.zeros(self.num_envs, device=self.device)
+        self.sum_velocities_x = torch.zeros(self.num_envs, device=self.device)
+        self.episode_lengths_s = torch.zeros(self.num_envs, device=self.device)
+        self.step_counts = torch.zeros(self.num_envs, device=self.device)
+        self.start_pos_x = torch.zeros(self.num_envs, device=self.device)
+
     def _resample_commands(self, envs_idx):
         self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["lin_vel_x_range"], (len(envs_idx),), self.device)
         self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["lin_vel_y_range"], (len(envs_idx),), self.device)
         self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["ang_vel_range"], (len(envs_idx),), self.device)
 
     def step(self, actions):
-        self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
-        exec_actions = self.last_actions if self.simulate_action_latency else self.actions
-        target_dof_pos = exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
-        self.robot.control_dofs_position(target_dof_pos, self.motor_dofs)
-        self.scene.step()
+            self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+            exec_actions = self.last_actions if self.simulate_action_latency else self.actions
+            target_dof_pos = exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
+            self.robot.control_dofs_position(target_dof_pos, self.motor_dofs)
+            self.scene.step()
 
-        # update buffers
-        self.episode_length_buf += 1
-        self.base_pos[:] = self.robot.get_pos()
-        self.base_quat[:] = self.robot.get_quat()
-        self.base_euler = quat_to_xyz(
-            transform_quat_by_quat(torch.ones_like(self.base_quat) * self.inv_base_init_quat, self.base_quat),
-            rpy=True,
-            degrees=True,
-        )
-        inv_base_quat = inv_quat(self.base_quat)
-        self.base_lin_vel[:] = transform_by_quat(self.robot.get_vel(), inv_base_quat)
-        self.base_ang_vel[:] = transform_by_quat(self.robot.get_ang(), inv_base_quat)
-        self.feet_pos[:] = self.robot.get_links_pos()[:, [11, 12], :]
-        self.feet_quat[:] = self.robot.get_links_quat()[:, [11, 12], :]
-        self.feet_lin_vel[:] = self.robot.get_links_vel()[:, [11, 12], :]
-        self.feet_ang_vel[:] = self.robot.get_links_ang()[:, [11, 12], :]
-        self.feet_contact_force[:] = self.robot.get_links_net_contact_force()[:, [11, 12], :]
-        self.projected_gravity = transform_by_quat(self.global_gravity, inv_base_quat)
-        self.dof_pos[:] = self.robot.get_dofs_position(self.motor_dofs)
-        self.dof_vel[:] = self.robot.get_dofs_velocity(self.motor_dofs)
+            # update buffers
+            self.episode_length_buf += 1
+            self.base_pos[:] = self.robot.get_pos()
+            self.base_quat[:] = self.robot.get_quat()
+            self.base_euler = quat_to_xyz(
+                transform_quat_by_quat(torch.ones_like(self.base_quat) * self.inv_base_init_quat, self.base_quat),
+                rpy=True,
+                degrees=True,
+            )
+            inv_base_quat = inv_quat(self.base_quat)
+            self.base_lin_vel[:] = transform_by_quat(self.robot.get_vel(), inv_base_quat)
+            self.base_ang_vel[:] = transform_by_quat(self.robot.get_ang(), inv_base_quat)
+            self.feet_pos[:] = self.robot.get_links_pos()[:, [11, 12], :]
+            self.feet_quat[:] = self.robot.get_links_quat()[:, [11, 12], :]
+            self.feet_lin_vel[:] = self.robot.get_links_vel()[:, [11, 12], :]
+            self.feet_ang_vel[:] = self.robot.get_links_ang()[:, [11, 12], :]
+            self.feet_contact_force[:] = self.robot.get_links_net_contact_force()[:, [11, 12], :]
+            self.projected_gravity = transform_by_quat(self.global_gravity, inv_base_quat)
+            self.dof_pos[:] = self.robot.get_dofs_position(self.motor_dofs)
+            self.dof_vel[:] = self.robot.get_dofs_velocity(self.motor_dofs)
 
-        # resample commands
-        envs_idx = (
-            (self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0)
-            .nonzero(as_tuple=False)
-            .flatten()
-        )
-        self._resample_commands(envs_idx)
+            # 毎ステップの走行データを蓄積
+            current_vel_x = self.base_lin_vel[:, 0]  # 現在のX軸前進速度
+            self.max_velocities_x = torch.maximum(self.max_velocities_x, current_vel_x)
+            self.sum_velocities_x += current_vel_x
+            self.episode_lengths_s += self.dt
+            self.step_counts += 1.0
 
-        # compute observations
-        self.obs_buf = torch.cat(
-            [
-                self.base_ang_vel * self.obs_scales["ang_vel"],  # 3
-                self.projected_gravity,  # 3
-                self.commands * self.commands_scale,  # 3
-                (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],  # 12
-                self.dof_vel * self.obs_scales["dof_vel"],  # 12
-                self.actions,  # 12
-                self.base_pos * self.obs_scales_pos, # 3
-            ],
-            axis=-1,
-        )
+            # resample commands
+            envs_idx = (
+                (self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0)
+                .nonzero(as_tuple=False)
+                .flatten()
+            )
+            self._resample_commands(envs_idx)
 
-        # check termination and reset
-        self.reset_buf = self.episode_length_buf > self.max_episode_length
-        self.reset_buf |= torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
-        self.reset_buf |= torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
+            # compute observations
+            self.obs_buf = torch.cat(
+                [
+                    self.base_ang_vel * self.obs_scales["ang_vel"],  # 3
+                    self.projected_gravity,  # 3
+                    self.commands * self.commands_scale,  # 3
+                    (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],  # 12
+                    self.dof_vel * self.obs_scales["dof_vel"],  # 12
+                    self.actions,  # 12
+                    self.base_pos * self.obs_scales_pos,  # 3
+                ],
+                axis=-1,
+            )
 
-        time_out_idx = (self.episode_length_buf > self.max_episode_length).nonzero(as_tuple=False).flatten()
-        self.extras["time_outs"] = torch.zeros_like(self.reset_buf, device=self.device, dtype=gs.tc_float)
-        self.extras["time_outs"][time_out_idx] = 1.0
+            # check termination and reset
+            self.reset_buf = self.episode_length_buf > self.max_episode_length
+            self.reset_buf |= torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
+            self.reset_buf |= torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
 
-        self.reset_idx(self.reset_buf.nonzero(as_tuple=False).flatten())
+            time_out_idx = (self.episode_length_buf > self.max_episode_length).nonzero(as_tuple=False).flatten()
+            self.extras["time_outs"] = torch.zeros_like(self.reset_buf, device=self.device, dtype=gs.tc_float)
+            self.extras["time_outs"][time_out_idx] = 1.0
 
-        # compute reward
-        self.rew_buf[:] = 0.0
-        for name, reward_func in self.reward_functions.items():
-            rew = reward_func() * self.reward_scales[name]
-            self.rew_buf += rew
-            self.episode_sums[name] += rew
+            # リセット対象環境の抽出と reset_idx の実行
+            reset_env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
+            self.reset_idx(reset_env_ids)
 
+            # compute reward
+            self.rew_buf[:] = 0.0
+            for name, reward_func in self.reward_functions.items():
+                rew = reward_func() * self.reward_scales[name]
+                self.rew_buf += rew
+                self.episode_sums[name] += rew
 
-        self.last_actions[:] = self.actions[:]
-        self.last_dof_vel[:] = self.dof_vel[:]
+            self.last_actions[:] = self.actions[:]
+            self.last_dof_vel[:] = self.dof_vel[:]
 
-        # add
-        self.extras["observations"]["critic"] = self.obs_buf
-
-        # return self.obs_buf, None, self.rew_buf, self.reset_buf, self.extras # old
-        return self.obs_buf, self.rew_buf, self.reset_buf, self.extras # new
+            self.extras["observations"]["critic"] = self.obs_buf
+            return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
 
     def get_observations(self):
         self.extras["observations"]["critic"] = self.obs_buf
@@ -218,49 +231,81 @@ class Sbr1Env:
     def get_privileged_observations(self):
         return None
 
+
     def reset_idx(self, envs_idx):
-        if len(envs_idx) == 0:
-            return
+            
+            # 1. リセット直前のデータ（最終X座標・完走フラグ）をクリア前に退避
+            last_pos_x = self.base_pos[envs_idx, 0].clone()
+            completed_mask = self.episode_length_buf[envs_idx] >= self.max_episode_length
+            fallen_mask = ~completed_mask
 
-        # reset dofs
-        self.dof_pos[envs_idx] = self.default_dof_pos
-        self.dof_vel[envs_idx] = 0.0
-        self.robot.set_dofs_position(
-            position=self.dof_pos[envs_idx],
-            dofs_idx_local=self.motor_dofs,
-            zero_velocity=True,
-            envs_idx=envs_idx,
-        )
-
-        # reset base
-        self.base_pos[envs_idx] = self.base_init_pos
-        self.base_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
-        self.robot.set_pos(self.base_pos[envs_idx], zero_velocity=False, envs_idx=envs_idx)
-        self.robot.set_quat(self.base_quat[envs_idx], zero_velocity=False, envs_idx=envs_idx)
-        self.base_lin_vel[envs_idx] = 0
-        self.base_ang_vel[envs_idx] = 0
-        self.robot.zero_all_dofs_velocity(envs_idx)
-
-        # reset buffers
-        self.last_actions[envs_idx] = 0.0
-        self.last_dof_vel[envs_idx] = 0.0
-        self.episode_length_buf[envs_idx] = 0
-        self.reset_buf[envs_idx] = True
-
-        # randomization
-        self.randomize_friction()
-        self.randomize_pd_gains(67, 150, 20, 45)
-        self.randomize_armature()
-
-        # fill extras
-        self.extras["episode"] = {}
-        for key in self.episode_sums.keys():
-            self.extras["episode"]["rew_" + key] = (
-                torch.mean(self.episode_sums[key][envs_idx]).item() / self.env_cfg["episode_length_s"]
+            # reset dofs
+            self.dof_pos[envs_idx] = self.default_dof_pos
+            self.dof_vel[envs_idx] = 0.0
+            self.robot.set_dofs_position(
+                position=self.dof_pos[envs_idx],
+                dofs_idx_local=self.motor_dofs,
+                zero_velocity=True,
+                envs_idx=envs_idx,
             )
-            self.episode_sums[key][envs_idx] = 0.0
 
-        self._resample_commands(envs_idx)
+            # reset base
+            self.base_pos[envs_idx] = self.base_init_pos
+            self.base_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
+            self.robot.set_pos(self.base_pos[envs_idx], zero_velocity=True, envs_idx=envs_idx)
+            self.robot.set_quat(self.base_quat[envs_idx], zero_velocity=True, envs_idx=envs_idx)
+            self.base_lin_vel[envs_idx] = 0
+            self.base_ang_vel[envs_idx] = 0
+            self.robot.zero_all_dofs_velocity(envs_idx)
+
+            # reset buffers
+            self.last_actions[envs_idx] = 0.0
+            self.last_dof_vel[envs_idx] = 0.0
+            self.episode_length_buf[envs_idx] = 0
+            self.reset_buf[envs_idx] = True
+
+            # randomization
+            if not self.eval_mode:
+                self.randomize_friction()
+                self.randomize_pd_gains(67, 150, 20, 45)
+                self.randomize_armature()
+
+            # fill extras
+            self.extras["episode"] = {}
+            
+            # 報酬の集計
+            for key in self.episode_sums.keys():
+                self.extras["episode"]["rew_" + key] = (
+                    torch.mean(self.episode_sums[key][envs_idx]).item() / self.env_cfg["episode_length_s"]
+                )
+                self.episode_sums[key][envs_idx] = 0.0
+
+            # TensorBoard用メトリクス集計
+            traveled_distance = last_pos_x - self.start_pos_x[envs_idx]
+            avg_vel_x = self.sum_velocities_x[envs_idx] / torch.clamp(self.step_counts[envs_idx], min=1.0)
+
+            if fallen_mask.any():
+                fall_time = self.episode_lengths_s[envs_idx[fallen_mask]].mean().item()
+            else:
+                fall_time = 0.0
+
+            self.extras["episode"]["Performance/max_lin_vel_x"] = self.max_velocities_x[envs_idx].mean().item()
+            self.extras["episode"]["Performance/avg_lin_vel_x"] = avg_vel_x.mean().item()
+            self.extras["episode"]["Performance/final_distance_x"] = traveled_distance.mean().item()
+
+            self.extras["episode"]["Stability/survival_time_s"] = self.episode_lengths_s[envs_idx].mean().item()
+            self.extras["episode"]["Stability/completion_rate"] = completed_mask.float().mean().item() * 100.0
+            self.extras["episode"]["Stability/fall_time_s"] = fall_time
+
+            self._resample_commands(envs_idx)
+
+            # リセットされた環境のバッファ初期化
+            self.max_velocities_x[envs_idx] = 0.0
+            self.sum_velocities_x[envs_idx] = 0.0
+            self.episode_lengths_s[envs_idx] = 0.0
+            self.step_counts[envs_idx] = 0.0
+            self.start_pos_x[envs_idx] = self.base_pos[envs_idx, 0]
+            print(f"Reset triggered! Friction: {self.friction if hasattr(self, 'friction') else 'N/A'}")
 
     def reset(self):
         self.reset_buf[:] = True
