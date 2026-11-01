@@ -69,6 +69,18 @@ def main():
     save_dir = os.path.expanduser("~/logs/sbr1_locomotion")
     os.makedirs(save_dir, exist_ok=True)
 
+    # =========================================================
+    # ★ ここで足部リンクのインデックスを特定する（1回だけ実行）
+    # =========================================================
+    left_foot_idx = None
+    right_foot_idx = None
+
+    # リンク一覧から確定したインデックスを直接セット
+    left_foot_idx = 11   # ankle_roll_left_link
+    right_foot_idx = 12  # ankle_roll_right_link
+
+    print(f"足リンク番号設定 -> 左足: {left_foot_idx}, 右足: {right_foot_idx}")
+
     # --------------------------------------------------
     # hip_pitch_right_joint のインデックス特定
     # --------------------------------------------------
@@ -100,7 +112,9 @@ def main():
     obs, _ = env.reset()
 
     print(f"評価を開始します (最大 {args.max_episodes} エピソード)。Ctrl+C で途中終了可能。")
-
+    # 最初の目標速度を表示
+    print(f"--- Episode {episode_count} Start ---")
+    print(f"Target Command (vx, vy, wz): {env.commands[0].cpu().numpy()}")
     try:
         with torch.no_grad():
             while total_step < args.max_steps and episode_count <= args.max_episodes:
@@ -108,6 +122,13 @@ def main():
 
                 actions = policy(obs)
                 obs, _, dones, _ = env.step(actions)
+
+                # 特定したインデックスを使って地面反力を取得
+                net_forces = env.robot.get_links_net_contact_force()
+                left_grf = net_forces[0, left_foot_idx, 2].item()  # 左足Z方向の力
+                right_grf = net_forces[0, right_foot_idx, 2].item() # 右足Z方向の力
+                
+                print(f"右足垂直反力: {right_grf:.2f} N, 左足垂直反力: {left_grf:.2f} N")
 
                 # トルクの取得
                 if hasattr(env, "torques"):
@@ -132,6 +153,11 @@ def main():
 
                     episode_count += 1
                     current_ep_torque = []
+
+                    # ★ 新しいエピソードの目標速度を表示
+                    if episode_count <= args.max_episodes:
+                        print(f"\n--- Episode {episode_count} Start ---")
+                        print(f"Target Command (vx, vy, wz): {env.commands[0].cpu().numpy()}")
 
                 t_elapsed = time.perf_counter() - t_start
                 sleep_time = max(0.0, env.dt - t_elapsed)
