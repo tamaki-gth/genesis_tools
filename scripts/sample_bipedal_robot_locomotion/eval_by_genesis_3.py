@@ -125,11 +125,16 @@ def main():
 
                 # 特定したインデックスを使って地面反力を取得
                 net_forces = env.robot.get_links_net_contact_force()
-                left_grf = net_forces[0, left_foot_idx, 2].item()  # 左足Z方向の力
-                right_grf = net_forces[0, right_foot_idx, 2].item() # 右足Z方向の力
+                left_grf_3d = net_forces[0, left_foot_idx].cpu().numpy()   # 左足 [Fx, Fy, Fz]
+                right_grf_3d = net_forces[0, right_foot_idx].cpu().numpy() # 右足 [Fx, Fy, Fz]                
                 
-                print(f"右足垂直反力: {right_grf:.2f} N, 左足垂直反力: {left_grf:.2f} N")
+                # 各成分に分解
+                left_fx, left_fy, left_fz = left_grf_3d
+                right_fx, right_fy, right_fz = right_grf_3d
 
+                print(f"Step {total_step:03d}")
+                print(f"  左足 GRF [Fx, Fy, Fz]: {left_fx:6.2f}, {left_fy:6.2f}, {left_fz:6.2f} N")
+                print(f"  右足 GRF [Fx, Fy, Fz]: {right_fx:6.2f}, {right_fy:6.2f}, {right_fz:6.2f} N")
                 # トルクの取得
                 if hasattr(env, "torques"):
                     all_torques = env.torques[0].cpu().numpy()
