@@ -121,6 +121,12 @@ def main():
 
     # 録画用カメラの取得（t_sbr1_env.py 側で scene.build() 前に追加されているカメラ）
     cam = getattr(env, "cam", None)
+    if cam is not None:
+        # ロボットの傾き（姿勢）にカメラが連動しないよう切り離す
+        try:
+            cam.detach()
+        except Exception:
+            pass
     if cam is None:
         print("【注意】env.cam が見つかりません。動画を保存するには t_sbr1_env.py の scene.build() 直前に self.cam を追加してください。")
     else:
@@ -231,32 +237,39 @@ def main():
                         )
 
                 # =========================================================
-                # ★ ロボットを斜め上から追従するカメラ位置の更新とキャプチャ
+                # ★ 地面と平行な目線で真横から追従するカメラ設定
                 # =========================================================
                 if cam is not None:
-                    # ロボットの現在位置 [x, y, z] を取得
                     robot_pos = env.base_pos[0].cpu().numpy()
 
-                    # カメラの相対位置オフセット [前後(X), 左右(Y), 高さ(Z)]
-                    # 例: 斜め後ろ上（後ろ1.5m, 右横1.8m, 高さ1.5m）から見下ろす
-                    cam_offset = np.array([-1.5, -1.8, 1.5])
+                    # カメラの高さ（地面からの目線の高さ [m]）
+                    eye_height = 0.75
+                    # ロボットの真横（Y方向）に離れる距離 [m]（-2.5 で左→右へ前進、+2.5 で右→左へ前進）
+                    side_distance = -2.5
 
-                    # 歩行の上下動で画面が酔わないよう、高さ(Z)は固定してX・Yだけ追従させる
+                    # カメラ位置と注視点の高さ(Z)を完全に一致させて地面と平行にする
                     cam_pos = np.array([
-                        robot_pos[0] + cam_offset[0],
-                        robot_pos[1] + cam_offset[1],
-                        cam_offset[2],
+                        robot_pos[0],
+                        robot_pos[1] + side_distance,
+                        eye_height,
                     ])
-                    # 注視点はロボットの胴体付近（高さ0.85m）に合わせる
-                    cam_lookat = np.array([robot_pos[0], robot_pos[1], 0.85])
+                    cam_lookat = np.array([
+                        robot_pos[0],
+                        robot_pos[1],
+                        eye_height,
+                    ])
 
-                    cam.set_pose(pos=cam_pos, lookat=cam_lookat)
+                    # up=(0, 0, 1) を指定し、カメラの水平（地面の水平）を絶対に傾けない
+                    cam.set_pose(
+                        pos=cam_pos,
+                        lookat=cam_lookat,
+                        up=(0.0, 0.0, 1.0),
+                    )
 
                     render_out = cam.render()
                     rgb = render_out[0] if isinstance(render_out, tuple) else render_out
                     if rgb is not None:
                         current_ep_frames.append(np.asarray(rgb, dtype=np.uint8))
-
                 print(f"Step {total_step:03d}")
                 print(f"  左足 GRF [Fx, Fy, Fz]: {left_fx:6.2f}, {left_fy:6.2f}, {left_fz:6.2f} N")
                 print(f"  右足 GRF [Fx, Fy, Fz]: {right_fx:6.2f}, {right_fy:6.2f}, {right_fz:6.2f} N")
