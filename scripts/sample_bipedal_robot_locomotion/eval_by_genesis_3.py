@@ -1,6 +1,7 @@
 #!/usr/bin/env -S python3 -i
 
 import argparse
+import csv
 import os
 import time
 import torch
@@ -14,18 +15,106 @@ from sbr1_train import get_cfgs, get_train_cfg
 from rsl_rl.runners import OnPolicyRunner
 
 
-def save_torque_plot(torque_history, episode_num, joint_name, save_dir):
-    """1エピソード分の右股関節ピッチのトルクグラフを作成して保存する関数"""
+def quat_to_euler_deg(quat_wxyz):
+    """Genesisのクォータニオン [w, x, y, z] をオイラー角 [roll, pitch, yaw] (deg) に変換"""
+    w, x, y, z = quat_wxyz
+
+    # Roll (X軸回り)
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = np.arctan2(sinr_cosp, cosr_cosp)
+
+    # Pitch (Y軸回り：正が前傾)
+    sinp = np.clip(2.0 * (w * y - z * x), -1.0, 1.0)
+    pitch = np.arcsin(sinp)
+
+    # Yaw (Z軸回り)
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+    return np.degrees([roll, pitch, yaw])
+
+
+def save_episode_timeseries(history, episode_num, save_dir):
+    """横軸を秒数[s]に揃えたエピソード全体の同期グラフ(.png)と全計測データ(.csv)を保存する"""
+    if len(history) == 0:
+        return
+
+    # 1. CSVファイルの書き出し（後から1周期のストライドやケイデンスを精密解析する用）
+    csv_path = os.path.join(save_dir, f"eval_ep{episode_num}_timeseries.csv")
+    fieldnames = list(history[0].keys())
+    with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(history)
+    print(f"エピソード {episode_num} の全時系列CSVを保存しました: {csv_path}")
+
+    # 2. 同期グラフの描画（横軸：秒数 [s]）
+    t = np.array([row["time_s"] for row in history])
+
+    left_fz = np.array([row["left_fz"] for row in history])
+    right_fz = np.array([row["right_fz"] for row in history])
+
+    left_fx = np.array([row["left_fx"] for row in history])
+    right_fx = np.array([row["right_fx"] for row in history])
+
+    com_vx = np.array([row["com_vx"] for row in history])
+    com_vz = np.array([row["com_vz"] for row in history])
+    cmd_vx = np.array([row["cmd_vx"] for row in history])
+
+    pitch_deg = np.array([row["pitch_deg"] for row in history])
+
+    fig, axes = plt.subplots(4, 1, figsize=(12, 11), sharex=True)
+
+    # [1段目] 垂直地面反力 Fz（接地・離地・両脚支持期の確認）
+    axes[0].plot(t, left_fz, color="tab:blue", linewidth=1.4, label="Left Foot Fz")
+    axes[0].plot(t, right_fz, color="tab:red", linewidth=1.4, label="Right Foot Fz")
+    axes[0].set_ylabel("Vertical GRF\nFz [N]")
+    axes[0].set_title(f"Episode {episode_num} Whole-Body Locomotion Analysis (Time-Synced)")
+    axes[0].grid(True, linestyle="--", alpha=0.6)
+    axes[0].legend(loc="upper right")
+
+    # [2段目] 前後地面反力 Fx（着地ブレーキ < 0 と蹴り出し推進 > 0 の確認）
+    axes[1].axhline(0.0, color="gray", linewidth=0.9, linestyle=":")
+    axes[1].plot(t, left_fx, color="tab:blue", linewidth=1.4, label="Left Foot Fx")
+    axes[1].plot(t, right_fx, color="tab:red", linewidth=1.4, label="Right Foot Fx")
+    axes[1].set_ylabel("Fore-Aft GRF\nFx [N]")
+    axes[1].grid(True, linestyle="--", alpha=0.6)
+    axes[1].legend(loc="upper right")
+
+    # [3段目] 重心速度 vx, vz（加速期 vs 定常歩行期の判別）
+    axes[2].plot(t, com_vx, color="tab:green", linewidth=1.6, label="CoM vx (Forward)")
+    axes[2].plot(t, cmd_vx, color="black", linewidth=1.2, linestyle="--", label="Target cmd_vx")
+    axes[2].plot(t, com_vz, color="tab:cyan", linewidth=1.2, alpha=0.85, label="CoM vz (Vertical)")
+    axes[2].set_ylabel("CoM Velocity\n[m/s]")
+    axes[2].grid(True, linestyle="--", alpha=0.6)
+    axes[2].legend(loc="upper right")
+
+    # [4段目] 胴体前傾角度 Pitch（加速時の前傾と定常時の姿勢安定性）
+    axes[3].axhline(0.0, color="gray", linewidth=0.9, linestyle=":")
+    axes[3].plot(t, pitch_deg, color="tab:purple", linewidth=1.5, label="Trunk Pitch (+: Forward Lean)")
+    axes[3].set_ylabel("Trunk Pitch\n[deg]")
+    axes[3].set_xlabel("Time [s]")
+    axes[3].grid(True, linestyle="--", alpha=0.6)
+    axes[3].legend(loc="upper right")
+
+    plt.tight_layout()
+    fig_path = os.path.join(save_dir, f"eval_ep{episode_num}_overview_sec.png")
+    plt.savefig(fig_path, dpi=300)
+    plt.close()
+    print(f"エピソード {episode_num} の全体同期グラフを保存しました: {fig_path}")
+
+
+def save_torque_plot(torque_history, time_history, episode_num, joint_name, save_dir):
+    """1エピソード分の右股関節ピッチのトルクグラフ（横軸：秒数）を保存する関数"""
     if len(torque_history) == 0:
         return
 
-    torque_array = np.array(torque_history)  # [steps]
-    steps_range = np.arange(len(torque_history))
+    plt.figure(figsize=(10, 4.5))
+    plt.plot(time_history, torque_history, color="tab:red", linewidth=1.5, label=joint_name)
 
-    plt.figure(figsize=(10, 5))
-    plt.plot(steps_range, torque_array, color="tab:red", linewidth=1.5, label=joint_name)
-
-    plt.xlabel("Step")
+    plt.xlabel("Time [s]")
     plt.ylabel("Torque [Nm]")
     plt.title(f"Right Hip Pitch Torque Over Time (Episode {episode_num})")
     plt.grid(True, linestyle="--", alpha=0.6)
@@ -85,6 +174,17 @@ def draw_grf_3axis(scene, pos, grf_3d, xy_scale, z_scale, radius=0.012):
             color=(0.2, 0.5, 1.0, 0.9),
         )
 
+def draw_grf_x(scene, pos, grf_3d, xy_scale, radius=0.014):
+    """地面反力の X軸方向（前後力 Fx：赤）のみを描画する関数"""
+    fx = grf_3d[0]
+    if abs(fx) > 0.5:
+        scene.draw_debug_arrow(
+            pos=pos,
+            vec=np.array([fx * xy_scale, 0.0, 0.0]),
+            radius=radius,
+            color=(1.0, 0.2, 0.2, 0.95),
+        )
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -119,18 +219,16 @@ def main():
     save_dir = os.path.expanduser("~/logs/sbr1_locomotion")
     os.makedirs(save_dir, exist_ok=True)
 
-    # 録画用カメラの取得（t_sbr1_env.py 側で scene.build() 前に追加されているカメラ）
+    # 録画用カメラの取得と姿勢追従の切り離し
     cam = getattr(env, "cam", None)
     if cam is not None:
-        # ロボットの傾き（姿勢）にカメラが連動しないよう切り離す
         try:
             cam.detach()
         except Exception:
             pass
-    if cam is None:
-        print("【注意】env.cam が見つかりません。動画を保存するには t_sbr1_env.py の scene.build() 直前に self.cam を追加してください。")
+        print("録画用カメラを検出しました（地面水平・真横アングルで等速・スロー動画を保存します）。")
     else:
-        print("録画用カメラを検出しました（ビューアと同じ視点で等速・スロー動画を自動保存します）。")
+        print("【注意】env.cam が見つかりません。動画を保存するには t_sbr1_env.py の scene.build() 直前に self.cam を追加してください。")
 
     base_fps = max(1, int(round(1.0 / env.dt)))
 
@@ -153,16 +251,18 @@ def main():
                 target_idx = idx
 
     if target_idx is None:
-        print(f"警告: {target_name} が見つからなかったため、0番目の関節を使用します。")
         target_idx = 0
         joint_label = "Joint 0 (Default)"
     else:
         joint_label = all_dof_names[target_idx]
-        print(f"対象関節を特定: {joint_label} (インデックス: {target_idx})")
 
     current_ep_torque = []
+    current_ep_times = []
+    current_ep_history = []
     current_ep_frames = []
+
     episode_count = 1
+    ep_step = 0
     total_step = 0
 
     obs, _ = env.reset()
@@ -172,9 +272,9 @@ def main():
     print(f"Target Command (vx, vy, wz): {env.commands[0].cpu().numpy()}")
 
     # ロボットの各リンク質量と全質量を計算
-    link_masses = np.array([getattr(link, 'mass', getattr(link, 'inertial_mass', 0.0)) for link in env.robot.links])
+    link_masses = np.array([getattr(link, "mass", getattr(link, "inertial_mass", 0.0)) for link in env.robot.links])
     total_mass = float(np.sum(link_masses))
-    print(f"ロボット全質量: {total_mass:.2f} kg")
+    print(f"ロボット全質量: {total_mass:.2f} kg / 制御周期 dt: {env.dt:.4f} s ({base_fps} Hz)")
 
     # 矢印描画用のスケール設定
     GRF_XY_SCALE = 0.015    # 水平力(Fx, Fy)用: 20 N -> 長さ 0.30 m
@@ -189,10 +289,13 @@ def main():
                 actions = policy(obs)
                 obs, _, dones, _ = env.step(actions)
 
+                # 経過秒数 [s]
+                time_s = ep_step * env.dt
+
                 # 地面反力を取得
                 net_forces = env.robot.get_links_net_contact_force()
-                left_grf_3d = net_forces[0, left_foot_idx].cpu().numpy()   # 左足 [Fx, Fy, Fz]
-                right_grf_3d = net_forces[0, right_foot_idx].cpu().numpy() # 右足 [Fx, Fy, Fz]
+                left_grf_3d = net_forces[0, left_foot_idx].cpu().numpy()
+                right_grf_3d = net_forces[0, right_foot_idx].cpu().numpy()
 
                 left_fx, left_fy, left_fz = left_grf_3d
                 right_fx, right_fy, right_fz = right_grf_3d
@@ -206,74 +309,75 @@ def main():
                 com_az = (total_grf[2] / total_mass) - 9.81
                 com_acc_3d = np.array([com_ax, com_ay, com_az])
 
-                # =========================================================
-                # ★ 3D空間上への矢印描画（録画より先に実行する）
-                # =========================================================
+                # 全リンク位置と重心（CoM）座標の算出
+                links_pos = env.robot.get_links_pos()[0].cpu().numpy()
+                left_foot_pos = links_pos[left_foot_idx]
+                right_foot_pos = links_pos[right_foot_idx]
+
+                if total_mass > 0:
+                    com_pos = np.sum(links_pos * link_masses[:, None], axis=0) / total_mass
+                else:
+                    com_pos = env.base_pos[0].cpu().numpy()
+
+                # ワールド座標系での重心速度 [vx, vy, vz] の算出
+                if hasattr(env.robot, "get_links_vel") and total_mass > 0:
+                    links_vel = env.robot.get_links_vel()[0].cpu().numpy()
+                    com_vel = np.sum(links_vel * link_masses[:, None], axis=0) / total_mass
+                elif hasattr(env.robot, "get_vel"):
+                    com_vel = env.robot.get_vel()[0].cpu().numpy()
+                else:
+                    com_vel = env.base_lin_vel[0].cpu().numpy()
+
+                # 胴体姿勢角（Roll, Pitch, Yaw [deg]）の算出
+                base_quat = env.base_quat[0].cpu().numpy()
+                roll_deg, pitch_deg, yaw_deg = quat_to_euler_deg(base_quat)
+
+                # 目標コマンド [vx, vy, wz]
+                cmd_vec = env.commands[0].cpu().numpy()
+
+                # 3D空間上への矢印描画
                 if hasattr(env, "scene"):
                     env.scene.clear_debug_objects()
+                    # draw_grf_3axis(env.scene, left_foot_pos, left_grf_3d, GRF_XY_SCALE, GRF_Z_SCALE)
+                    # draw_grf_3axis(env.scene, right_foot_pos, right_grf_3d, GRF_XY_SCALE, GRF_Z_SCALE)
 
-                    links_pos = env.robot.get_links_pos()[0].cpu().numpy()
-                    left_foot_pos = links_pos[left_foot_idx]
-                    right_foot_pos = links_pos[right_foot_idx]
+                    draw_grf_x(env.scene, left_foot_pos, left_grf_3d, GRF_XY_SCALE) 
+                    draw_grf_x(env.scene, right_foot_pos, right_grf_3d, GRF_XY_SCALE) 
 
-                    if total_mass > 0:
-                        com_pos = np.sum(links_pos * link_masses[:, None], axis=0) / total_mass
-                    else:
-                        com_pos = env.base_pos[0].cpu().numpy()
+                    # if np.linalg.norm(com_acc_3d) > 0.1:
+                    #     env.scene.draw_debug_arrow(
+                    #         pos=com_pos,
+                    #         vec=com_acc_3d * ACC_ARROW_SCALE,
+                    #         radius=0.018,
+                    #         color=(1.0, 0.9, 0.1, 0.9),
+                    #     )
 
-                    # 1. 左足の地面反力（X:赤, Y:緑, Z:青）
-                    draw_grf_3axis(env.scene, left_foot_pos, left_grf_3d, GRF_XY_SCALE, GRF_Z_SCALE)
-
-                    # 2. 右足の地面反力（X:赤, Y:緑, Z:青）
-                    draw_grf_3axis(env.scene, right_foot_pos, right_grf_3d, GRF_XY_SCALE, GRF_Z_SCALE)
-
-                    # 3. 重心加速度（黄色矢印）
-                    if np.linalg.norm(com_acc_3d) > 0.1:
+                    # 3. 重心の前後加速度 ax のみ（黄色矢印）
+                    # スケールを GRF_XY_SCALE * total_mass にすると、赤い矢印の合計長さと一致する
+                    ax_scale = GRF_XY_SCALE * total_mass
+                    if abs(com_ax) > 0.1:
                         env.scene.draw_debug_arrow(
                             pos=com_pos,
-                            vec=com_acc_3d * ACC_ARROW_SCALE,
+                            vec=np.array([com_ax * ax_scale, 0.0, 0.0]),
                             radius=0.018,
-                            color=(1.0, 0.9, 0.1, 0.9),
-                        )
+                            color=(1.0, 0.9, 0.1, 0.95),
+                     )
 
-                # =========================================================
-                # ★ 地面と平行な目線で真横から追従するカメラ設定
-                # =========================================================
+                # 地面と平行な真横目線カメラの更新とキャプチャ
                 if cam is not None:
                     robot_pos = env.base_pos[0].cpu().numpy()
-
-                    # カメラの高さ（地面からの目線の高さ [m]）
                     eye_height = 0.75
-                    # ロボットの真横（Y方向）に離れる距離 [m]（-2.5 で左→右へ前進、+2.5 で右→左へ前進）
                     side_distance = -2.5
 
-                    # カメラ位置と注視点の高さ(Z)を完全に一致させて地面と平行にする
-                    cam_pos = np.array([
-                        robot_pos[0],
-                        robot_pos[1] + side_distance,
-                        eye_height,
-                    ])
-                    cam_lookat = np.array([
-                        robot_pos[0],
-                        robot_pos[1],
-                        eye_height,
-                    ])
+                    cam_pos = np.array([robot_pos[0], robot_pos[1] + side_distance, eye_height])
+                    cam_lookat = np.array([robot_pos[0], robot_pos[1], eye_height])
 
-                    # up=(0, 0, 1) を指定し、カメラの水平（地面の水平）を絶対に傾けない
-                    cam.set_pose(
-                        pos=cam_pos,
-                        lookat=cam_lookat,
-                        up=(0.0, 0.0, 1.0),
-                    )
+                    cam.set_pose(pos=cam_pos, lookat=cam_lookat, up=(0.0, 0.0, 1.0))
 
                     render_out = cam.render()
                     rgb = render_out[0] if isinstance(render_out, tuple) else render_out
                     if rgb is not None:
                         current_ep_frames.append(np.asarray(rgb, dtype=np.uint8))
-                print(f"Step {total_step:03d}")
-                print(f"  左足 GRF [Fx, Fy, Fz]: {left_fx:6.2f}, {left_fy:6.2f}, {left_fz:6.2f} N")
-                print(f"  右足 GRF [Fx, Fy, Fz]: {right_fx:6.2f}, {right_fy:6.2f}, {right_fz:6.2f} N")
-                print(f" 重心加速度 [ax, ay, az]: [{com_ax:6.2f}, {com_ay:6.2f}, {com_az:6.2f}] m/s^2")
 
                 # トルクの取得
                 if hasattr(env, "torques"):
@@ -287,17 +391,60 @@ def main():
                     all_torques = (kp * (target_pos - current_pos) - kd * current_vel_dof).cpu().numpy()
 
                 current_ep_torque.append(all_torques[target_idx])
+                current_ep_times.append(time_s)
 
+                # 時系列レコードの蓄積
+                current_ep_history.append({
+                    "time_s": round(time_s, 4),
+                    "step": ep_step,
+                    "com_x": float(com_pos[0]),
+                    "com_y": float(com_pos[1]),
+                    "com_z": float(com_pos[2]),
+                    "com_vx": float(com_vel[0]),
+                    "com_vy": float(com_vel[1]),
+                    "com_vz": float(com_vel[2]),
+                    "cmd_vx": float(cmd_vec[0]),
+                    "cmd_vy": float(cmd_vec[1]),
+                    "cmd_wz": float(cmd_vec[2]),
+                    "roll_deg": float(roll_deg),
+                    "pitch_deg": float(pitch_deg),
+                    "yaw_deg": float(yaw_deg),
+                    "left_foot_x": float(left_foot_pos[0]),
+                    "left_foot_z": float(left_foot_pos[2]),
+                    "right_foot_x": float(right_foot_pos[0]),
+                    "right_foot_z": float(right_foot_pos[2]),
+                    "left_fx": float(left_fx),
+                    "left_fy": float(left_fy),
+                    "left_fz": float(left_fz),
+                    "right_fx": float(right_fx),
+                    "right_fy": float(right_fy),
+                    "right_fz": float(right_fz),
+                    "com_ax": float(com_ax),
+                    "com_ay": float(com_ay),
+                    "com_az": float(com_az),
+                })
+
+                print(
+                    f"t={time_s:5.2f}s (Step {ep_step:03d}) | "
+                    f"vx={com_vel[0]:5.2f} m/s | Pitch={pitch_deg:5.1f} deg | "
+                    f"L_Fz={left_fz:6.1f} N, R_Fz={right_fz:6.1f} N"
+                )
+
+                ep_step += 1
                 total_step += 1
 
                 # 転倒・リセット判定
                 if dones[0]:
-                    print(f"\n[リセット検知] エピソード {episode_count} 終了 ({len(current_ep_torque)} ステップ)")
-                    save_torque_plot(current_ep_torque, episode_count, joint_label, save_dir)
+                    print(f"\n[リセット検知] エピソード {episode_count} 終了 ({time_s:.2f} 秒 / {ep_step} ステップ)")
+                    save_episode_timeseries(current_ep_history, episode_count, save_dir)
+                    save_torque_plot(current_ep_torque, current_ep_times, episode_count, joint_label, save_dir)
                     save_videos(current_ep_frames, episode_count, save_dir, base_fps=base_fps, slow_ratio=args.slow_ratio)
 
                     episode_count += 1
+                    ep_step = 0
                     current_ep_torque = []
+                    current_ep_times = []
+                    current_ep_history = []
                     current_ep_frames = []
 
                     if episode_count <= args.max_episodes:
@@ -311,9 +458,10 @@ def main():
     except KeyboardInterrupt:
         print("\n手動で停止しました。")
 
-    if len(current_ep_torque) > 0 and episode_count <= args.max_episodes:
+    if len(current_ep_history) > 0 and episode_count <= args.max_episodes:
         print(f"計測中のエピソード {episode_count} のデータを保存します...")
-        save_torque_plot(current_ep_torque, episode_count, joint_label, save_dir)
+        save_episode_timeseries(current_ep_history, episode_count, save_dir)
+        save_torque_plot(current_ep_torque, current_ep_times, episode_count, joint_label, save_dir)
         save_videos(current_ep_frames, episode_count, save_dir, base_fps=base_fps, slow_ratio=args.slow_ratio)
 
     print("すべての処理が完了しました。")
