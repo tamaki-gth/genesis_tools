@@ -69,6 +69,18 @@ class Sbr1Env:
             ),
         )
 
+        # t_sbr1_env.py の __init__ 内、self.scene.build() の直前に追記
+        if eval_mode:
+            self.cam = self.scene.add_camera(
+                res=(1280, 960),
+                pos=(2.5, -2.5, 1.5),
+                lookat=(0.0, 0.0, 0.8),
+                fov=40,
+                GUI=False,
+            )
+
+        # この下に元の self.scene.build(...) がある
+        
         # build
         self.scene.build(n_envs=num_envs)
 
@@ -137,6 +149,12 @@ class Sbr1Env:
         self.start_pos_x = torch.zeros(self.num_envs, device=self.device)
 
     def _resample_commands(self, envs_idx):
+        if self.eval_mode:
+        # 評価時は目標速度を 0（または固定値）に設定
+            self.commands[envs_idx, 0] = 0.0  # vx
+            self.commands[envs_idx, 1] = 0.0  # vy
+            self.commands[envs_idx, 2] = 0.0  # wz
+            return
         self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["lin_vel_x_range"], (len(envs_idx),), self.device)
         self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["lin_vel_y_range"], (len(envs_idx),), self.device)
         self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["ang_vel_range"], (len(envs_idx),), self.device)
@@ -305,7 +323,7 @@ class Sbr1Env:
             self.episode_lengths_s[envs_idx] = 0.0
             self.step_counts[envs_idx] = 0.0
             self.start_pos_x[envs_idx] = self.base_pos[envs_idx, 0]
-            print(f"Reset triggered! Friction: {self.friction if hasattr(self, 'friction') else 'N/A'}")
+            # print(f"Reset triggered! Friction: {self.friction if hasattr(self, 'friction') else 'N/A'}")
 
     def reset(self):
         self.reset_buf[:] = True
